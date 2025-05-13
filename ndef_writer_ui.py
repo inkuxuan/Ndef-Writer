@@ -9,8 +9,8 @@ from tkinter import ttk, messagebox
 import threading
 import time
 from ndef_writer_common import construct_ndef, get_reader, wait_for_card
-from write_ndef_classic import write_ndef_message_multi, format_sector0, format_trailers
-from write_ndef_ultralight import write_ndef_message as write_ndef_message_ultralight
+from write_ndef_classic import write_ndef_message_multi, format_sector0, format_trailers, try_authenticate_block, read_candidate_keys
+from write_ndef_ultralight import write_ndef_message as write_ndef_message_ultralight, read_page
 from smartcard.System import readers
 
 class NDEFWriterUI:
@@ -42,6 +42,8 @@ class NDEFWriterUI:
         self.write_button.pack(side=tk.LEFT, padx=5)
         self.bulk_button = ttk.Button(button_frame, text="Bulk Write", command=self.toggle_bulk_write)
         self.bulk_button.pack(side=tk.LEFT, padx=5)
+        self.stress_button = ttk.Button(button_frame, text="Stress Test", command=self.toggle_stress_test)
+        self.stress_button.pack(side=tk.LEFT, padx=5)
         
         # Status
         self.status_var = tk.StringVar(value="Ready")
@@ -53,6 +55,11 @@ class NDEFWriterUI:
         self.bulk_thread = None
         self.current_reader = None
         self.cards_written_count = 0
+        
+        # Stress test state
+        self.stress_test_active = False
+        self.stress_thread = None
+        self.stress_read_count = 0
 
     def write_card(self, from_bulk=False):
         """Write URL to a single card.
@@ -76,9 +83,10 @@ class NDEFWriterUI:
             if self.card_type.get() == "NTAG213":
                 write_ndef_message_ultralight(connection, ndef_message)
             else:  # MIFARE Classic
-                write_ndef_message_multi(connection, ndef_message, [[0xFF] * 6])  # Default key
-                format_sector0(connection, [[0xFF] * 6])
-                format_trailers(connection, [[0xFF] * 6])
+                candidate_keys = read_candidate_keys("keys.txt")
+                write_ndef_message_multi(connection, ndef_message, candidate_keys)
+                format_sector0(connection, candidate_keys)
+                format_trailers(connection, candidate_keys)
             
             if from_bulk:
                 self.cards_written_count += 1
@@ -151,6 +159,134 @@ class NDEFWriterUI:
             self.status_var.set("Ready")
             if self.bulk_thread:
                 self.bulk_thread.join(timeout=1.0)
+            self.current_reader = None
+
+    def read_card(self):
+        """Read NDEF data from a card.
+        
+        Returns:
+            bool: True if read was successful, False otherwise
+        """
+        self.status_var.set("Reading card...")
+        reader, connection = get_reader()
+        if not reader or not connection:
+            self.status_var.set("No reader found")
+            return False
+        
+        try:
+            if self.card_type.get() == "NTAG213":
+                # For NTAG213, read the first few pages to verify NDEF data
+                # Read capability container (page 3)
+                cc_data = read_page(connection, 3)
+                if cc_data[0] != 0xE1:  # Check if it's a valid NDEF tag
+                    self.status_var.set("Not a valid NDEF tag")
+                    return False
+                
+                # Read first NDEF data page (page 4)
+                ndef_data = read_page(connection, 4)
+                if ndef_data[0] != 0x03:  # Check if it starts with NDEF TLV tag
+                    self.status_var.set("No NDEF message found")
+                    return False
+                
+                return True
+            else:  # MIFARE Classic
+                # For MIFARE Classic, try to authenticate and read sector 1
+                candidate_keys = read_candidate_keys("keys.txt")
+                try:
+                    # Try to authenticate block 4 (first block of sector 1)
+                    key, key_type = try_authenticate_block(connection, 4, candidate_keys)
+                    return True
+                except Exception as e:
+                    self.status_var.set(f"Authentication failed: {str(e)}")
+                    return False
+        except Exception as e:
+            self.status_var.set(f"Read failed: {str(e)}")
+            return False
+        finally:
+            connection.disconnect()
+    
+    def stress_test_loop(self):
+        """Background thread for stress testing (write and read repeatedly)."""
+        # Get reader once at the start
+        available_readers = readers()
+        if not available_readers:
+            self.root.after(0, lambda: self.status_var.set("No reader found"))
+            return
+        
+        self.current_reader = available_readers[0]
+        self.root.after(0, lambda: self.status_var.set("Stress test active - place a card on the reader"))
+        
+        url = self.url_entry.get().strip()
+        if not url:
+            self.root.after(0, lambda: self.status_var.set("Error: Please enter a URL"))
+            self.stress_test_active = False
+            self.stress_button.configure(text="Stress Test")
+            return
+        
+        while self.stress_test_active:
+            try:
+                # Try to connect to a card
+                connection = self.current_reader.createConnection()
+                connection.connect()
+                connection.disconnect()
+                
+                # Card detected, write to it
+                self.root.after(0, lambda: self.status_var.set(f"Writing to card... (Successful reads: {self.stress_read_count})"))
+                
+                # Write to the card
+                reader, connection = get_reader()
+                if reader and connection:
+                    try:
+                        ndef_message = construct_ndef(url)
+                        if self.card_type.get() == "NTAG213":
+                            write_ndef_message_ultralight(connection, ndef_message)
+                        else:  # MIFARE Classic
+                            candidate_keys = read_candidate_keys("keys.txt")
+                            write_ndef_message_multi(connection, ndef_message, candidate_keys)
+                        
+                        connection.disconnect()
+                        time.sleep(0.5)  # Small delay after write
+                        
+                        # Now try to read it back
+                        self.root.after(0, lambda: self.status_var.set(f"Reading from card... (Successful reads: {self.stress_read_count})"))
+                        if self.read_card():
+                            self.stress_read_count += 1
+                            self.root.after(0, lambda: self.status_var.set(f"Read successful - Successful reads: {self.stress_read_count}"))
+                        else:
+                            self.root.after(0, lambda: self.status_var.set(f"Read failed - Successful reads: {self.stress_read_count}"))
+                        
+                        time.sleep(1)  # Wait a bit before next cycle
+                    except Exception as e:
+                        self.root.after(0, lambda: self.status_var.set(f"Error: {str(e)} - Successful reads: {self.stress_read_count}"))
+                        time.sleep(1)
+            except:
+                # No card present, wait a bit
+                time.sleep(0.1)
+    
+    def toggle_stress_test(self):
+        """Toggle stress test mode."""
+        if not self.stress_test_active:
+            # Make sure bulk write is not active
+            if self.bulk_write_active:
+                self.toggle_bulk_write()
+                
+            self.stress_test_active = True
+            self.stress_read_count = 0
+            self.stress_button.configure(text="Stop")
+            self.write_button.configure(state="disabled")
+            self.bulk_button.configure(state="disabled")
+            self.status_var.set("Initializing stress test...")
+            self.stress_thread = threading.Thread(target=self.stress_test_loop)
+            self.stress_thread.daemon = True
+            self.stress_thread.start()
+        else:
+            self.stress_test_active = False
+            self.stress_button.configure(text="Stress Test")
+            self.write_button.configure(state="normal")
+            self.bulk_button.configure(state="normal")
+            self.status_var.set("Ready")
+            if self.stress_thread:
+                self.stress_thread.join(timeout=1.0)
             self.current_reader = None
 
 def main():

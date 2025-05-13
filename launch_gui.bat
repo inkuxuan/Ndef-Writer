@@ -1,0 +1,1 @@
+uv run ndef_writer_ui.py
